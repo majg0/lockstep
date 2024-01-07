@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2" # DOCS: https://doc.rust-lang.org/cargo/reference/resolver.html#resolver-versions
+members = [
+  "client",
+  "server",
+  "shared",
+]
+
+[profile.dev]
+opt-level = 2
+
