@@ -5,7 +5,7 @@ use clap::Parser;
 use shared::{
     net::{
         client::{Client, ClientEvent, ClientState},
-        network::{bind_socket, SERVER_PORT, NETWORK_FPS},
+        network::{bind_socket, NETWORK_FPS, SERVER_PORT},
     },
     sim::{physics_test::PhysicsTest, GameState, Lobby, LobbyMessage},
     timing::FrameDurationAccumulator,
@@ -26,13 +26,13 @@ struct Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    eprintln!("{:?}", args);
+    println!("{:?}", args);
 
     let mut client = {
         let socket = {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), args.port);
             let socket = bind_socket(addr)?;
-            eprintln!("Socket bound to {}", addr);
+            println!("Socket bound to {}", addr);
             socket
         };
 
@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Client::new(socket, server_addr, NETWORK_FPS)
     };
 
-    let mut sim = FrameDurationAccumulator::with_fps(2.0, 0.25);
+    let mut sim = FrameDurationAccumulator::with_fps(50.0, 0.25);
 
     let mut state = GameState::Lobby;
     let mut lobby = Lobby::new();
@@ -51,12 +51,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         match client.process_packets() {
             Some(ClientEvent::Connected) => {
-                eprintln!("connected");
+                println!("connected");
                 lobby.add_player(client.index); // hey, it's me!
             }
             Some(ClientEvent::ConnectionTimeout) => {
-                eprintln!("disconnected");
-                todo!("reconnect");
+                todo!("handle connection timeout");
             }
             None => {}
         }
@@ -86,8 +85,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 GameState::Running => {
-                    while let Some(message) = client.read_new::<PhysicsTest>() {
-                        eprintln!("server position: {:?}", message.position);
+                    while let Some(_message) = client.read_new::<PhysicsTest>() {
+                        // println!("server position: {:?}", message.position);
                     }
 
                     sim.run_frame(|frame| {
@@ -100,13 +99,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // debug
                         {
-                            let PhysicsTest {
-                                position,
-                                velocity,
-                                acceleration,
-                                ..
-                            } = physics_test;
-                            println!("\tp={}\tdp={}\tddp={}", position, velocity, acceleration);
+                            let PhysicsTest { .. } = physics_test;
+                            // println!("\tp={}\tdp={}\tddp={}", position, velocity, acceleration);
                         }
                     });
 
@@ -121,6 +115,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // NOTE: don't use all of the CPU core
-        // std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }

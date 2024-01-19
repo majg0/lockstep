@@ -14,14 +14,24 @@ use crate::{
     },
 };
 
+/// in bytes
+pub const UDP_IP_HEADER_SIZE: u32 = 28;
+
 pub const PROTOCOL_ID: u32 = u32::from_le_bytes(*b"MAJG");
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const SERVER_PORT: u16 = 4321;
 /// NOTE: lower than PMTU limitation 548
 pub const PACKET_BUFFER_SIZE: usize = 512;
-/// NOTE: we can afford such a low timeout because of high fps
-pub const CONNECTION_TIMEOUT_DURATION: f64 = 0.5;
-pub const NETWORK_FPS: f64 = 50.0;
+pub const CONNECTION_TIMEOUT_DURATION: f64 = 1.;
+pub const NETWORK_FPS: f64 = 100.;
+pub const PACKET_RESEND_FRAME_INTERVAL: u16 = 10;
+
+/// Our target max Bps usage both up and down for a server
+pub const MAX_BITS_PER_SECOND: f64 = 1e6;
+pub const MAX_SERVER_BYTES_PER_SECOND: f64 = MAX_BITS_PER_SECOND / 8.;
+pub const MAX_CLIENTS: u8 = 8;
+pub const MAX_CLIENT_BYTES_PER_SECOND: f64 = MAX_SERVER_BYTES_PER_SECOND / MAX_CLIENTS as f64;
+pub const PRINT_NETWORK_STATS: bool = true;
 
 pub fn bind_socket(address: SocketAddr) -> io::Result<UdpSocket> {
     let socket = UdpSocket::bind(address)?;
@@ -121,9 +131,7 @@ impl NetworkSeq {
 
     pub const INVALID: Self = Self(Self::OUT_OF_BOUNDS);
 
-    /// NOTE: assuming max 50 Hz send rate and 1s timeout, and that packets fit in single buffers,
-    /// this is a high enough count!
-    pub const COUNT: usize = 64;
+    pub const COUNT: usize = 128;
     pub const OUT_OF_BOUNDS: u16 = u16::MAX;
     pub const BITMASK: u16 = Self::COUNT as u16 - 1;
     pub const MID_VALUE: u16 = Self::COUNT as u16 >> 1;
@@ -207,7 +215,7 @@ impl Default for SendPacket {
 pub struct ReceivePacket {
     pub header: PacketHeader,
     pub buffer: Buffer,
-    pub handled: bool
+    pub handled: bool,
 }
 
 impl Default for ReceivePacket {
@@ -246,24 +254,14 @@ impl<T: DefaultArray> SequenceBuffer<T> {
     }
 
     pub fn dbg_print(&self) {
-      // for i in 0..NetworkSeq::COUNT {
-      //   if i % 8 == 0 {
-      //     eprint!("{}", i / 8);
-      //   } else if i % 4 == 0 {
-      //     eprint!(":");
-      //   } else {
-      //     eprint!(".");
-      //   }
-      // }
-      // eprintln!("");
-      for i in 0..NetworkSeq::COUNT {
-        if self.contains(NetworkSeq(i as u16)) {
-          eprint!("1");
-        } else {
-          eprint!("0");
+        for i in 0..NetworkSeq::COUNT {
+            if self.contains(NetworkSeq(i as u16)) {
+                print!("1");
+            } else {
+                print!("0");
+            }
         }
-      }
-      eprintln!("");
+        println!();
     }
 
     pub fn contains(&self, seq: NetworkSeq) -> bool {

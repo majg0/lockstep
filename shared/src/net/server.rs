@@ -1,13 +1,17 @@
 use std::net::{SocketAddr, UdpSocket};
 
 use crate::{
+    moving_average::MovingAverage,
     net::{
         buffer::Buffer,
-        network::{PacketType, PACKET_BUFFER_SIZE},
-        reliable_ordered::ReliableOrderedDatagramEndpoint,
+        network::{
+            PacketType, MAX_CLIENTS, MAX_CLIENT_BYTES_PER_SECOND, PACKET_BUFFER_SIZE,
+            PRINT_NETWORK_STATS,
+        },
+        reliable_ordered::{EndpointSendStats, ReliableOrderedDatagramEndpoint},
         stream::{ReadStream, Stream, Streamable},
     },
-    timing::FrameDurationAccumulator, moving_average::MovingAverage,
+    timing::FrameDurationAccumulator,
 };
 
 use super::{network::ConnectionAcceptedPacket, reliable_ordered::EndpointState};
@@ -18,23 +22,32 @@ pub struct Server {
     swap_buffer: Buffer,
     endpoints: Vec<Option<ReliableOrderedDatagramEndpoint>>,
     timing: FrameDurationAccumulator,
-    pub bytes_per_frame_avg: f64,
+    pub tx_per_frame_avg: f64,
+    pub rx_per_frame_avg: f64,
 }
 
+#[derive(Debug)]
 pub enum ServerEvent {
     ClientTimeout(u8),
     ClientConnected(u8),
 }
 
 impl Server {
-    pub fn new(socket: UdpSocket, max_peer_count: usize, fps: f64) -> Server {
+    pub fn new(socket: UdpSocket, max_peer_count: u8, fps: f64) -> Server {
+        let capacity = max_peer_count as usize;
+        let mut endpoints = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            endpoints.push(None);
+        }
+
         Server {
-            capacity: max_peer_count,
+            capacity,
             socket,
             swap_buffer: Buffer::with_capacity(PACKET_BUFFER_SIZE),
-            endpoints: Vec::new(),
+            endpoints,
             timing: FrameDurationAccumulator::with_fps(fps, 0.25),
-            bytes_per_frame_avg: 0.0,
+            tx_per_frame_avg: 0.0,
+            rx_per_frame_avg: 0.0,
         }
     }
 
@@ -49,31 +62,69 @@ impl Server {
     pub fn process_packets(&mut self) -> Option<ServerEvent> {
         let mut event = None;
 
-        self.timing.accumulate_duration();
+        self.timing.run_frame(|frame| {
+            let mut stats = EndpointSendStats::default();
 
-        while self.timing.frame_available() {
-            let mut bytes_sent = 0usize;
+            // TODO: no vec allocation every frame
+            let mut states = Vec::with_capacity(self.capacity);
 
-            for (index, slot) in self.endpoints.iter_mut().enumerate() {
+            for index in 0..self.capacity {
+                let slot = &mut self.endpoints[index];
+
                 if let Some(endpoint) = slot {
-                    match endpoint.send_outstanding(&self.socket) {
-                        EndpointState::Ok(stats) => {
-                            bytes_sent += stats.bytes_sent;
+                    let state = endpoint.send_outstanding(&self.socket);
+
+                    match state {
+                        EndpointState::Ok(endpoint_stats) => {
+                            stats += &endpoint_stats;
+                            states.push(Some(endpoint_stats));
                         }
                         EndpointState::ConnectionTimeout => {
-                            assert!(event.is_none(), "we don't need a server event queue");
+                            assert!(event.is_none(), "we don't need a server event queue for now; {:?}", event);
                             event = Some(ServerEvent::ClientTimeout(index as u8));
+                            states.push(None);
                             *slot = None;
                         }
                     }
+                } else {
+                    states.push(None);
                 }
             }
 
-            // NOTE: this acts as a low pass filter
-            self.bytes_per_frame_avg.exponential_moving_average(bytes_sent as f64, 0.1);
+            if PRINT_NETWORK_STATS {
+                // NOTE: this acts as a low pass filter
+                self.tx_per_frame_avg.exponential_moving_average(stats.total_bytes_sent as f64, 0.1);
+                self.rx_per_frame_avg.exponential_moving_average(stats.total_bytes_received as f64, 0.1);
 
-            self.timing.consume_frame();
-        }
+                let txps = self.tx_per_frame_avg / frame.dt;
+                let rxps = self.rx_per_frame_avg / frame.dt;
+                // TODO: precompute count
+                let n = self.endpoints.iter().flatten().map(|_| 1.).sum::<f64>();
+
+                println!(
+                    "| Bps% {prxps:5.1}↓ {ptxps:5.1}↑ | Bps {rxps:6.0}↓ {txps:6.0}↑ | B {rx:5}↓ {tx:5}↑ | p {nprx:2}/{prx:<2}↓ {ptx:2}↑ | peers {n}/{nmax} | rtt ms {rtt} | frame {frame:7} @ {fps}/s|",
+                    frame = frame.index,
+                    n = n,
+                    nmax = MAX_CLIENTS,
+                    fps = 1. / frame.dt,
+                    rx = stats.total_bytes_received,
+                    tx = stats.total_bytes_sent,
+                    txps = txps,
+                    rxps = rxps,
+                    ptxps = if n == 0. { 0. } else { txps / n } / MAX_CLIENT_BYTES_PER_SECOND * 100.,
+                    prxps = if n == 0. { 0. } else { rxps / n } / MAX_CLIENT_BYTES_PER_SECOND * 100.,
+                    nprx = stats.new_packets_received,
+                    prx = stats.packets_received,
+                    ptx = stats.packets_created,
+                    rtt = states.iter().map(|e| {
+                        match e {
+                            Some(stats) => format!("{:3.0}", stats.rtt_avg * 1e3),
+                            None => "  x".to_string(),
+                        }
+                    }).collect::<Vec<_>>().join(",")
+                );
+            }
+        });
 
         if let Some((header, address)) =
             ReadStream(&mut self.swap_buffer).receive_packet(&self.socket)
@@ -100,12 +151,13 @@ impl Server {
                                 self.endpoints[free] =
                                     Some(ReliableOrderedDatagramEndpoint::new(address));
                             } else {
-                                let next = self.endpoints.len();
-                                if next < self.capacity {
-                                    self.endpoints
-                                        .push(Some(ReliableOrderedDatagramEndpoint::new(address)));
-                                    index = next;
-                                }
+                                assert!(index == self.endpoints.len(), "we're pre-pushing None to fill capacity");
+                                // let next = self.endpoints.len();
+                                // if next < self.capacity {
+                                //     self.endpoints
+                                //         .push(Some(ReliableOrderedDatagramEndpoint::new(address)));
+                                //     index = next;
+                                // }
                             }
                         }
 
@@ -116,7 +168,11 @@ impl Server {
                             endpoint.write_packet(PacketType::ConnectionAccepted, |w| {
                                 ConnectionAcceptedPacket::new(index).stream(w);
                             });
-                            assert!(event.is_none(), "we don't need a server event queue");
+                            assert!(
+                                event.is_none(),
+                                "we don't need a server event queue for now; {:?}",
+                                event
+                            );
                             event = Some(ServerEvent::ClientConnected(index as u8));
                         } else {
                             // NOTE: we silently deny for now; maybe we shouldn't, but this is simpler
@@ -183,7 +239,7 @@ impl Server {
 
     pub fn drop_incoming(&mut self) {
         for endpoint in self.endpoints.iter_mut().flatten() {
-            while let Some(_) = endpoint.peek_message() {
+            while endpoint.peek_message().is_some() {
                 endpoint.mark_handled();
             }
         }

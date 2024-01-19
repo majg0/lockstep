@@ -3,13 +3,18 @@ use std::{
     time::Instant,
 };
 
-use crate::{net::{
-    buffer::Buffer,
-    network::{NetworkSeq, PacketHeader, PacketType, ReceivePacket, SendPacket, SequenceBuffer},
-    stream::{ReadStream, WriteStream},
-}, moving_average::MovingAverage};
+use crate::{
+    moving_average::MovingAverage,
+    net::{
+        buffer::Buffer,
+        network::{
+            NetworkSeq, PacketHeader, PacketType, ReceivePacket, SendPacket, SequenceBuffer,
+        },
+        stream::{ReadStream, WriteStream},
+    },
+};
 
-use super::network::CONNECTION_TIMEOUT_DURATION;
+use super::network::{CONNECTION_TIMEOUT_DURATION, PACKET_RESEND_FRAME_INTERVAL, UDP_IP_HEADER_SIZE, MAX_CLIENT_BYTES_PER_SECOND, NETWORK_FPS};
 
 pub struct ReliableOrderedDatagramEndpoint {
     pub address: SocketAddr,
@@ -21,11 +26,42 @@ pub struct ReliableOrderedDatagramEndpoint {
     first_receive_seq: NetworkSeq,
     /// average round trip time
     rtt_avg: f64,
+    own_bytes_received_since_last_send: u32,
+    total_bytes_received_since_last_send: u32,
     packets_created_since_last_send: u16,
+    packets_received_since_last_send: u16,
+    new_packets_received_since_last_send: u16,
 }
 
+#[derive(Default)]
 pub struct EndpointSendStats {
-    pub bytes_sent: usize,
+    /// bytes sent excluding UDP/IP header size
+    pub own_bytes_sent: u32,
+    /// bytes sent including UDP/IP header size
+    pub total_bytes_sent: u32,
+    /// bytes received excluding UDP/IP header size
+    pub own_bytes_received: u32,
+    /// bytes received including UDP/IP header size
+    pub total_bytes_received: u32,
+    pub packets_created: u16,
+    pub packets_received: u16,
+    pub new_packets_received: u16,
+    pub max_rtt: f64,
+    pub rtt_avg: f64,
+}
+
+impl std::ops::AddAssign<&EndpointSendStats> for EndpointSendStats {
+    fn add_assign(&mut self, rhs: &EndpointSendStats) {
+        self.own_bytes_sent += rhs.own_bytes_sent;
+        self.total_bytes_sent += rhs.total_bytes_sent;
+        self.own_bytes_received += rhs.own_bytes_received;
+        self.total_bytes_received += rhs.total_bytes_received;
+        self.packets_created += rhs.packets_created;
+        self.packets_received += rhs.packets_received;
+        self.new_packets_received += rhs.new_packets_received;
+        self.max_rtt = self.max_rtt.max(rhs.max_rtt);
+        self.rtt_avg += rhs.rtt_avg;
+    }
 }
 
 pub enum EndpointState {
@@ -45,8 +81,12 @@ impl ReliableOrderedDatagramEndpoint {
             receive_buffer: SequenceBuffer::new(),
             latest_receive_seq: NetworkSeq::wrap(0),
             first_receive_seq: NetworkSeq::wrap(0),
-            rtt_avg: 0.0,
+            rtt_avg: 0.,
+            own_bytes_received_since_last_send: 0,
+            total_bytes_received_since_last_send: 0,
             packets_created_since_last_send: 0,
+            packets_received_since_last_send: 0,
+            new_packets_received_since_last_send: 0,
         }
     }
 
@@ -87,9 +127,16 @@ impl ReliableOrderedDatagramEndpoint {
     }
 
     pub fn send_outstanding(&mut self, socket: &UdpSocket) -> EndpointState {
-        let mut bytes_sent = 0usize;
+        if self.packets_created_since_last_send == 0 {
+            // NOTE: must do this periodically in order to keep acks going, as acks are written on
+            // packet creation rather than before sending.
+            self.create_packet(PacketType::ConnectionKeepAlive);
+        }
+
+        let mut own_bytes_sent = 0;
+        let mut total_bytes_sent = 0;
         // send unacked packets
-        let current_max_packet_rtt = {
+        let max_rtt = {
             let update_time = Instant::now();
             let mut min_send_time = update_time;
 
@@ -99,25 +146,39 @@ impl ReliableOrderedDatagramEndpoint {
 
                 while seq_iter != self.next_send_seq {
                     if let Some(packet) = self.send_buffer.get_mut(seq_iter) {
-                        // send packet
-                        {
-                            let buffer = packet.buffer.written_slice();
-                            match socket.send_to(buffer, self.address) {
-                                Ok(_) => (),
-                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
-                                Err(e) => panic!("socket send io error: {e}"),
-                            };
-                            bytes_sent += packet.buffer.written_size();
-                        }
-
-                        // find earliest outstanding send time, for rtt estimation
-                        if let Some(send_time) = packet.first_send_time {
+                        // find earliest outstanding send time, for handling disconnects
+                        let send = if let Some(send_time) = packet.first_send_time {
                             if send_time < min_send_time {
                                 min_send_time = send_time;
                             }
+                            // NOTE: decrease bandwidth usage by only resending every nth frame
+                            let n = PACKET_RESEND_FRAME_INTERVAL;
+                            seq_iter.unwrap() % n == self.first_send_seq.unwrap() % n
                         } else {
                             packet.first_send_time = Some(Instant::now());
-                            // NOTE: since we just added it, no need to set min_send_time
+                            true
+                            // NOTE: since we're about to initially send, no need to set min_send_time
+                        };
+
+                        if send {
+                            let buffer = packet.buffer.written_slice();
+                            let size = packet.buffer.written_size() as u32;
+                            // NOTE: limit sent bytes to avoid congestion and excessive bandwidth
+                            // usage.
+                            // TODO: We prioritize retransmission of old packets now, and this
+                            // could pose a problem in high latency scenarios, as old packets will
+                            // be sent multiple times, while new packets are never sent at all.
+                            // This should be mitigated by the resend frame interval, but let's
+                            // monitor this over time!
+                            if size + UDP_IP_HEADER_SIZE + total_bytes_sent < (MAX_CLIENT_BYTES_PER_SECOND / NETWORK_FPS) as u32 {
+                                match socket.send_to(buffer, self.address) {
+                                    Ok(_) => (),
+                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                                    Err(e) => panic!("socket send io error: {e}"),
+                                };
+                                own_bytes_sent += size;
+                                total_bytes_sent += size + UDP_IP_HEADER_SIZE;
+                            }
                         }
                     }
                     seq_iter.wrapping_increment();
@@ -127,24 +188,42 @@ impl ReliableOrderedDatagramEndpoint {
             update_time.duration_since(min_send_time).as_millis() as f64 / 1e3
         };
 
-        if self.packets_created_since_last_send == 0 {
-            // NOTE: must do this periodically in order to keep acks going, as acks are written on
-            // packet creation rather than before sending.
-            self.create_packet(PacketType::ConnectionKeepAlive);
-        }
+        let packets_received = self.packets_received_since_last_send;
+        self.packets_received_since_last_send = 0;
+
+        let new_packets_received = self.new_packets_received_since_last_send;
+        self.new_packets_received_since_last_send = 0;
+
+        let own_bytes_received = self.own_bytes_received_since_last_send;
+        self.own_bytes_received_since_last_send = 0;
+
+        let total_bytes_received = self.total_bytes_received_since_last_send;
+        self.total_bytes_received_since_last_send = 0;
+
+        let packets_created = self.packets_created_since_last_send;
         self.packets_created_since_last_send = 0;
 
         // TODO: configurable timeout duration
-        if current_max_packet_rtt >= CONNECTION_TIMEOUT_DURATION {
+        if max_rtt >= CONNECTION_TIMEOUT_DURATION {
             // reset
             {
                 self.send_buffer.reset();
                 self.receive_buffer.reset();
-                self.rtt_avg = 0.0;
+                self.rtt_avg = 0.;
             }
             EndpointState::ConnectionTimeout
         } else {
-            EndpointState::Ok(EndpointSendStats { bytes_sent })
+            EndpointState::Ok(EndpointSendStats {
+                own_bytes_sent,
+                total_bytes_sent,
+                own_bytes_received,
+                total_bytes_received,
+                packets_created,
+                packets_received,
+                new_packets_received,
+                max_rtt,
+                rtt_avg: self.rtt_avg,
+            })
         }
     }
 
@@ -154,7 +233,7 @@ impl ReliableOrderedDatagramEndpoint {
                 let rtt = Instant::now().duration_since(first_send_time).as_millis() as f64 / 1e3;
 
                 // NOTE: this acts as a low pass filter on roundtrip time:
-                self.rtt_avg = self.rtt_avg.exponential_moving_average(rtt, 0.1);
+                self.rtt_avg.exponential_moving_average(rtt, 0.1);
 
                 // NOTE: we reset details at creation
                 self.send_buffer.mark_invalid(seq);
@@ -163,6 +242,12 @@ impl ReliableOrderedDatagramEndpoint {
     }
 
     pub fn receive_swap(&mut self, header: PacketHeader, buffer: &mut Buffer) {
+        self.packets_received_since_last_send += 1;
+        {
+            let size = buffer.read_size() as u32;
+            self.own_bytes_received_since_last_send += size;
+            self.total_bytes_received_since_last_send += size + UDP_IP_HEADER_SIZE;
+        }
 
         // advance most recently received sequence number
         {
@@ -174,7 +259,8 @@ impl ReliableOrderedDatagramEndpoint {
                 // we also can't delete immediately behind us, because that means we create acks
                 // for those packets in the send logic.
                 // 40 is because of the 32 ack bits + the seq + some nice padding.
-                self.receive_buffer.mark_invalid(header.seq.wrapping_sub(40));
+                self.receive_buffer
+                    .mark_invalid(header.seq.wrapping_sub(40));
                 seq.wrapping_increment();
             }
         }
@@ -184,6 +270,7 @@ impl ReliableOrderedDatagramEndpoint {
 
         // NOTE: if it's NOT a duplicate, mark it valid and swap it
         if header.seq >= self.first_receive_seq {
+            self.new_packets_received_since_last_send += 1;
             // NOTE: by swapping out the input buffer (32B pointing to heap memory), we retain the data
             let packet = self.receive_buffer.mark_valid(header.seq);
             std::mem::swap(buffer, &mut packet.buffer);

@@ -1,14 +1,19 @@
 use std::net::{SocketAddr, UdpSocket};
 
 use crate::{
+    moving_average::MovingAverage,
     net::{
         buffer::Buffer,
-        network::{ConnectionAcceptedPacket, PacketType, PACKET_BUFFER_SIZE},
+        network::{
+            ConnectionAcceptedPacket, PacketType, MAX_CLIENT_BYTES_PER_SECOND, PACKET_BUFFER_SIZE,
+        },
         reliable_ordered::{EndpointState, ReliableOrderedDatagramEndpoint},
         stream::{ReadStream, Stream, Streamable},
     },
-    timing::FrameDurationAccumulator, moving_average::MovingAverage,
+    timing::FrameDurationAccumulator,
 };
+
+use super::network::PRINT_NETWORK_STATS;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum ClientState {
@@ -24,7 +29,8 @@ pub struct Client {
     endpoint: ReliableOrderedDatagramEndpoint,
     timing: FrameDurationAccumulator,
     pub state: ClientState,
-    pub bytes_per_frame_avg: f64,
+    pub tx_per_frame_avg: f64,
+    pub rx_per_frame_avg: f64,
 }
 
 pub enum ClientEvent {
@@ -41,20 +47,36 @@ impl Client {
             endpoint: ReliableOrderedDatagramEndpoint::new(server_addr),
             timing: FrameDurationAccumulator::with_fps(fps, 0.25),
             state: ClientState::ConnectionRequest,
-            bytes_per_frame_avg: 0.0
+            tx_per_frame_avg: 0.,
+            rx_per_frame_avg: 0.,
         }
     }
 
     pub fn process_packets(&mut self) -> Option<ClientEvent> {
         let mut event = None;
 
-        self.timing.accumulate_duration();
-
-        while self.timing.frame_available() {
+        self.timing.run_frame(|frame| {
             match self.endpoint.send_outstanding(&self.socket) {
                 EndpointState::Ok(stats) => {
-                    // NOTE: this acts as a low pass filter
-                    self.bytes_per_frame_avg.exponential_moving_average(stats.bytes_sent as f64, 0.1);
+                    if PRINT_NETWORK_STATS {
+                        // NOTE: this acts as a low pass filter
+                        self.tx_per_frame_avg.exponential_moving_average(stats.total_bytes_sent as f64, 0.1);
+                        self.rx_per_frame_avg.exponential_moving_average(stats.total_bytes_received as f64, 0.1);
+
+                        let txps = self.tx_per_frame_avg / frame.dt;
+                        let rxps = self.rx_per_frame_avg / frame.dt;
+
+                        println!(
+                            "| Bps% {prxps:5.1}↓ {ptxps:5.1}↑ | Bps {rxps:6.0}↓ {txps:6.0}↑ | B {rx:5}↓ {tx:5}↑ | {fps} fps |",
+                            fps = 1. / frame.dt,
+                            rx = stats.total_bytes_received,
+                            tx = stats.total_bytes_sent,
+                            txps = txps,
+                            rxps = rxps,
+                            ptxps = txps / MAX_CLIENT_BYTES_PER_SECOND * 100.,
+                            prxps = rxps / MAX_CLIENT_BYTES_PER_SECOND * 100.
+                        );
+                    }
                 }
                 EndpointState::ConnectionTimeout => {
                     self.state = ClientState::ConnectionRequest;
@@ -62,9 +84,7 @@ impl Client {
                     event = Some(ClientEvent::ConnectionTimeout);
                 }
             }
-
-            self.timing.consume_frame();
-        }
+        });
 
         if let Some((header, address)) =
             ReadStream(&mut self.swap_buffer).receive_packet(&self.socket)
